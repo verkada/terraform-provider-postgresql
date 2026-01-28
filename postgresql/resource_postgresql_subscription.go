@@ -70,6 +70,23 @@ func resourcePostgreSQLSubscription() *schema.Resource {
 				Default:     true,
 				Description: "Specifies whether the subscription should be actively replicating or whether it should just be set up but not started yet. The default is true.",
 			},
+			"connect": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     true,
+				Description: "Specifies whether the subscription should connect to the publisher at all. The default is true.",
+			},
+			"copy_data": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     true,
+				Description: "Specifies whether to copy pre-existing data in the publications that are being subscribed to when the replication starts. The default is true.",
+			},
+			"start_lsn": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The LSN to start replication from when enabling a subscription. Can only be set when switching from an existing disabled subscription to enabled state.",
+			},
 		},
 	}
 }
@@ -77,6 +94,12 @@ func resourcePostgreSQLSubscription() *schema.Resource {
 func resourcePostgreSQLSubscriptionCreate(db *DBConnection, d *schema.ResourceData) error {
 	subName := d.Get("name").(string)
 	databaseName := getDatabaseForSubscription(d, db.client.databaseName)
+
+	// Validate that start_lsn is never used during creation
+	startLSN := d.Get("start_lsn").(string)
+	if startLSN != "" && startLSN != "0/0" {
+		return fmt.Errorf("start_lsn cannot be set during subscription creation. LSN positioning only works when transitioning from disabled to enabled state with need to advance start lsn offset")
+	}
 
 	publications, err := getPublicationsForSubscription(d)
 	if err != nil {
@@ -163,7 +186,7 @@ func resourcePostgreSQLSubscriptionReadImpl(db *DBConnection, d *schema.Resource
 		}
 		publications := setPublications.(*schema.Set).List()
 		d.Set("publications", publications)
-		
+
 		// Set enabled from config since we can't read it from the database
 		enabled := d.Get("enabled").(bool)
 		d.Set("enabled", enabled)
@@ -194,7 +217,12 @@ func resourcePostgreSQLSubscriptionUpdate(db *DBConnection, d *schema.ResourceDa
 
 	// Check if enabled has changed
 	if d.HasChange("enabled") {
-		enabled := d.Get("enabled").(bool)
+		oldEnabled, newEnabled := d.GetChange("enabled")
+		enabled := newEnabled.(bool)
+		startLSN := d.Get("start_lsn").(string)
+
+		log.Printf("[DEBUG] Subscription %s: enabled change from %v (%T) to %v (%T), start_lsn: %q",
+			subName, oldEnabled, oldEnabled, newEnabled, newEnabled, startLSN)
 
 		// Subscription operations cannot be done in a transaction
 		client := db.client.config.NewClient(databaseName)
@@ -203,18 +231,45 @@ func resourcePostgreSQLSubscriptionUpdate(db *DBConnection, d *schema.ResourceDa
 			return fmt.Errorf("could not establish database connection: %w", err)
 		}
 
-		var sql string
 		if enabled {
-			sql = fmt.Sprintf("ALTER SUBSCRIPTION %s ENABLE", pq.QuoteIdentifier(subName))
-		} else {
-			sql = fmt.Sprintf("ALTER SUBSCRIPTION %s DISABLE", pq.QuoteIdentifier(subName))
-		}
+			// If switching from disabled to enabled and LSN is provided, handle LSN positioning
+			if !oldEnabled.(bool) && startLSN != "" && startLSN != "0/0" {
+				// Get the subscription OID to find its replication origin
+				var subOid uint32
+				subQuery := "SELECT oid FROM pg_subscription WHERE subname = $1"
+				err := conn.QueryRow(subQuery, subName).Scan(&subOid)
+				if err != nil {
+					return fmt.Errorf("could not get subscription OID for %s: %w", subName, err)
+				}
 
-		if _, err := conn.Exec(sql); err != nil {
-			return fmt.Errorf("could not execute sql: %w", err)
+				// Replication origins are named "pg_<subscription_oid>" by PostgreSQL
+				originName := fmt.Sprintf("pg_%d", subOid)
+
+				// Advance the replication origin directly to the target LSN
+				advanceQuery := fmt.Sprintf("SELECT pg_replication_origin_advance('%s', '%s')",
+					strings.Replace(originName, "'", "''", -1), // Escape single quotes
+					strings.Replace(startLSN, "'", "''", -1))   // Escape single quotes
+
+				_, err = conn.Exec(advanceQuery)
+				if err != nil {
+					log.Printf("[ERROR] Failed to advance replication origin: %v", err)
+					return fmt.Errorf("could not advance replication origin %s to LSN %s: %w", originName, startLSN, err)
+				}
+			}
+
+			// Now enable the subscription - it will start from the advanced LSN position
+			sql := fmt.Sprintf("ALTER SUBSCRIPTION %s ENABLE", pq.QuoteIdentifier(subName))
+			if _, err := conn.Exec(sql); err != nil {
+				log.Printf("[ERROR] Failed to enable subscription %s: %v", subName, err)
+				return fmt.Errorf("could not execute sql: %w", err)
+			}
+		} else {
+			sql := fmt.Sprintf("ALTER SUBSCRIPTION %s DISABLE", pq.QuoteIdentifier(subName))
+			if _, err := conn.Exec(sql); err != nil {
+				return fmt.Errorf("could not execute sql: %w", err)
+			}
 		}
 	}
-
 	return resourcePostgreSQLSubscriptionReadImpl(db, d)
 }
 
@@ -355,9 +410,11 @@ func getOptionalParameters(d *schema.ResourceData) string {
 
 	createSlot, okCreate := d.GetOkExists("create_slot") //nolint:staticcheck
 	slotName, okName := d.GetOk("slot_name")
-	enabled, okEnabled := d.GetOkExists("enabled") //nolint:staticcheck
+	enabled, okEnabled := d.GetOkExists("enabled")     //nolint:staticcheck
+	copyData, okCopyData := d.GetOkExists("copy_data") //nolint:staticcheck
+	connect, okConnect := d.GetOkExists("connect")     //nolint:staticcheck
 
-	if !okCreate && !okName && !okEnabled {
+	if !okCreate && !okName && !okEnabled && !okCopyData && !okConnect {
 		// use default behavior, no WITH statement
 		return ""
 	}
@@ -371,6 +428,12 @@ func getOptionalParameters(d *schema.ResourceData) string {
 	}
 	if okEnabled {
 		params = append(params, fmt.Sprintf("%s = %t", "enabled", enabled.(bool)))
+	}
+	if okCopyData {
+		params = append(params, fmt.Sprintf("%s = %t", "copy_data", copyData.(bool)))
+	}
+	if okConnect {
+		params = append(params, fmt.Sprintf("%s = %t", "connect", connect.(bool)))
 	}
 
 	returnValue = fmt.Sprintf(parameterSQLTemplate, strings.Join(params, ", "))
