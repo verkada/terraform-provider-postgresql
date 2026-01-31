@@ -3,6 +3,7 @@ package postgresql
 import (
 	"crypto/sha256"
 	"fmt"
+	"log"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
@@ -81,7 +82,11 @@ func dataSourcePostgreSQLQueryRead(db *DBConnection, d *schema.ResourceData) err
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("[WARN] Failed to close rows: %v", err)
+		}
+	}()
 
 	columns, err := rows.Columns()
 	if err != nil {

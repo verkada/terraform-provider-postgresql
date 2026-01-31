@@ -95,9 +95,10 @@ func resourcePostgreSQLSubscriptionCreate(db *DBConnection, d *schema.ResourceDa
 	subName := d.Get("name").(string)
 	databaseName := getDatabaseForSubscription(d, db.client.databaseName)
 
+	log.Printf("[INFO] In subscription creation for %s on database %s", subName, databaseName)
 	// Validate that start_lsn is never used during creation
 	startLSN := d.Get("start_lsn").(string)
-	if startLSN != "" && startLSN != "0/0" {
+	if startLSN != "null" && startLSN != "" && startLSN != "0/0" {
 		return fmt.Errorf("start_lsn cannot be set during subscription creation. LSN positioning only works when transitioning from disabled to enabled state with need to advance start lsn offset")
 	}
 
@@ -125,9 +126,13 @@ func resourcePostgreSQLSubscriptionCreate(db *DBConnection, d *schema.ResourceDa
 		publications,
 		optionalParams,
 	)
+
+	log.Printf("[INFO] Creating subscription %s with SQL: %s", subName, sql)
 	if _, err := conn.Exec(sql); err != nil {
+		log.Printf("[ERROR] Failed to create subscription %s: %v", subName, err)
 		return fmt.Errorf("could not execute sql: %w", err)
 	}
+	log.Printf("[INFO] Successfully created subscription %s", subName)
 
 	d.SetId(generateSubscriptionID(d, databaseName))
 
@@ -221,7 +226,7 @@ func resourcePostgreSQLSubscriptionUpdate(db *DBConnection, d *schema.ResourceDa
 		enabled := newEnabled.(bool)
 		startLSN := d.Get("start_lsn").(string)
 
-		log.Printf("[DEBUG] Subscription %s: enabled change from %v (%T) to %v (%T), start_lsn: %q",
+		log.Printf("[INFO] Subscription %s: enabled change from %v (%T) to %v (%T), start_lsn: %q",
 			subName, oldEnabled, oldEnabled, newEnabled, newEnabled, startLSN)
 
 		// Subscription operations cannot be done in a transaction
@@ -233,7 +238,10 @@ func resourcePostgreSQLSubscriptionUpdate(db *DBConnection, d *schema.ResourceDa
 
 		if enabled {
 			// If switching from disabled to enabled and LSN is provided, handle LSN positioning
-			if !oldEnabled.(bool) && startLSN != "" && startLSN != "0/0" {
+			// Only proceed with LSN positioning if start_lsn is explicitly set to a valid LSN value
+			if !oldEnabled.(bool) && startLSN != "" && startLSN != "0/0" && startLSN != "null" && strings.Contains(startLSN, "/") {
+				log.Printf("[INFO] Positioning subscription %s to LSN %s before enabling", subName, startLSN)
+
 				// Get the subscription OID to find its replication origin
 				var subOid uint32
 				subQuery := "SELECT oid FROM pg_subscription WHERE subname = $1"
@@ -247,22 +255,24 @@ func resourcePostgreSQLSubscriptionUpdate(db *DBConnection, d *schema.ResourceDa
 
 				// Advance the replication origin directly to the target LSN
 				advanceQuery := fmt.Sprintf("SELECT pg_replication_origin_advance('%s', '%s')",
-					strings.Replace(originName, "'", "''", -1), // Escape single quotes
-					strings.Replace(startLSN, "'", "''", -1))   // Escape single quotes
+					strings.ReplaceAll(originName, "'", "''"), // Escape single quotes
+					strings.ReplaceAll(startLSN, "'", "''"))   // Escape single quotes
 
 				_, err = conn.Exec(advanceQuery)
 				if err != nil {
 					log.Printf("[ERROR] Failed to advance replication origin: %v", err)
 					return fmt.Errorf("could not advance replication origin %s to LSN %s: %w", originName, startLSN, err)
 				}
+				log.Printf("[INFO] Successfully advanced replication origin %s to LSN %s", originName, startLSN)
 			}
 
-			// Now enable the subscription - it will start from the advanced LSN position
+			// Enable the subscription
 			sql := fmt.Sprintf("ALTER SUBSCRIPTION %s ENABLE", pq.QuoteIdentifier(subName))
 			if _, err := conn.Exec(sql); err != nil {
 				log.Printf("[ERROR] Failed to enable subscription %s: %v", subName, err)
 				return fmt.Errorf("could not execute sql: %w", err)
 			}
+			log.Printf("[INFO] Successfully enabled subscription %s", subName)
 		} else {
 			sql := fmt.Sprintf("ALTER SUBSCRIPTION %s DISABLE", pq.QuoteIdentifier(subName))
 			if _, err := conn.Exec(sql); err != nil {
