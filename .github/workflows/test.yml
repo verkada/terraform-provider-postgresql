@@ -12,10 +12,11 @@ jobs:
 
     strategy:
       matrix:
-        pgversion: [16, 15, 14, 13, 12]
+        pgversion: [17, 16, 15, 14, 13]
 
     env:
       PGVERSION: ${{ matrix.pgversion }}
+      # TF_LOG: INFO
 
     steps:
       - name: Checkout
@@ -24,7 +25,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.25'
 
       - name: test
         run: make test
