@@ -375,7 +375,11 @@ func insertTestRows(t *testing.T, dbSuffix string, table string, columns []strin
 	if err != nil {
 		t.Fatalf("could not open connection pool for db %s: %v", dbName, err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("Failed to close database connection: %v", err)
+		}
+	}()
 
 	if _, err := db.Exec(query, args...); err != nil {
 		t.Fatalf("could not query %q: %v", query, err)

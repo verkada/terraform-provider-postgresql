@@ -302,7 +302,26 @@ func resourcePrivilegesEqual(granted *schema.Set, d *schema.ResourceData) bool {
 		}
 	}
 	wantedSet := schema.NewSet(schema.HashString, implicits)
-	return granted.Equal(wantedSet)
+
+	// Check if granted is equal to the full expected set
+	if granted.Equal(wantedSet) {
+		return true
+	}
+
+	// For compatibility with different PostgreSQL versions, check if the granted
+	// privileges are a subset of the expected privileges and contain the core
+	// privileges. Some privileges like MAINTAIN may not exist in older versions.
+	if objectType == "table" {
+		corePrivileges := []any{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"}
+		coreSet := schema.NewSet(schema.HashString, corePrivileges)
+
+		// Check if granted contains at least the core privileges and is a subset of expected
+		if coreSet.Intersection(granted).Equal(coreSet) && granted.Intersection(wantedSet).Equal(granted) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func pgArrayToSet(arr pq.ByteaArray) *schema.Set {
