@@ -124,6 +124,9 @@ func testAccCheckPostgresqlSubscriptionExistsWithStreaming(n string, checkStream
 		}
 
 		if checkStreaming {
+			// Give subscription time to establish streaming connection to avoid race conditions
+			// Increased duration to handle slower environments
+			time.Sleep(5 * time.Second)
 			streams, err := checkSubscriptionStreams(txn, subName)
 			if err != nil {
 				return fmt.Errorf("error checking subscription %s", err)

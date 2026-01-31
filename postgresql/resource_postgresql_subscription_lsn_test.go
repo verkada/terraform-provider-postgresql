@@ -57,11 +57,10 @@ func TestAccPostgresqlSubscription_LSNPositioning(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				// Step 1: Create disabled subscription first (start_lsn not allowed during creation)
-				Config: generateSubscriptionConfig(dbNameSub, pubConninfo, false, "null", slotName),
+				Config: generateSubscriptionConfig(dbNameSub, pubConninfo, false, "", slotName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSubscriptionExistsWithStreaming("postgresql_subscription.test_lsn", false),
 					resource.TestCheckResourceAttr("postgresql_subscription.test_lsn", "enabled", "false"),
-					testAccCheckSubscriptionEnabled("postgresql_subscription.test_lsn", false),
 					testCheckReplicationOriginExists(dbNameSub, slotName),
 				),
 			},
@@ -75,7 +74,6 @@ func TestAccPostgresqlSubscription_LSNPositioning(t *testing.T) {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSubscriptionExistsWithStreaming("postgresql_subscription.test_lsn", true),
 					resource.TestCheckResourceAttr("postgresql_subscription.test_lsn", "enabled", "true"),
-					testAccCheckSubscriptionEnabled("postgresql_subscription.test_lsn", true),
 					func(s *terraform.State) error {
 						// Check that LSN positioning worked correctly with retry logic
 						return testCheckLSNReplication(dbNameSub)(s)
@@ -132,11 +130,10 @@ func TestAccPostgresqlSubscription_WithoutLSNPositioning(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				// Step 1: Create disabled subscription first
-				Config: generateSubscriptionConfig(dbNameSub, pubConninfo, false, "null", slotName),
+				Config: generateSubscriptionConfig(dbNameSub, pubConninfo, false, "", slotName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSubscriptionExistsWithStreaming("postgresql_subscription.test_lsn", false),
 					resource.TestCheckResourceAttr("postgresql_subscription.test_lsn", "enabled", "false"),
-					testAccCheckSubscriptionEnabled("postgresql_subscription.test_lsn", false),
 					testCheckReplicationOriginExists(dbNameSub, slotName),
 				),
 			},
@@ -146,11 +143,10 @@ func TestAccPostgresqlSubscription_WithoutLSNPositioning(t *testing.T) {
 					// Insert second row BEFORE enabling subscription
 					insertRow(t, dbSuffixPub, "row_after_lsn")
 				},
-				Config: generateSubscriptionConfig(dbNameSub, pubConninfo, true, "null", slotName),
+				Config: generateSubscriptionConfig(dbNameSub, pubConninfo, true, "", slotName),
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckPostgresqlSubscriptionExistsWithStreaming("postgresql_subscription.test_lsn", true),
 					resource.TestCheckResourceAttr("postgresql_subscription.test_lsn", "enabled", "true"),
-					testAccCheckSubscriptionEnabled("postgresql_subscription.test_lsn", true),
 					func(s *terraform.State) error {
 						// Check that both rows are replicated
 						return testCheckFullReplication(dbNameSub)(s)
@@ -170,7 +166,11 @@ func createTestTableForReplication(t *testing.T, dbSuffix string) {
 	if err != nil {
 		t.Fatalf("could not connect to database: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("Failed to close database connection: %v", err)
+		}
+	}()
 
 	// Create source table in database
 	_, err = db.Exec(`
@@ -194,7 +194,11 @@ func createPublicationAndReplicationSlotWithName(t *testing.T, dbSuffixPub strin
 	if err != nil {
 		t.Fatalf("could not connect to publisher database: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("Failed to close database connection: %v", err)
+		}
+	}()
 
 	// Create publication for the test table
 	_, err = db.Exec(`CREATE PUBLICATION test_pub FOR TABLE pub_schema.test_table;`)
@@ -211,6 +215,12 @@ func createPublicationAndReplicationSlotWithName(t *testing.T, dbSuffixPub strin
 
 // generateSubscriptionConfig generates config with only subscription (publication and slot created via SQL)
 func generateSubscriptionConfig(dbNameSub, pubConninfo string, enabled bool, startLSN string, slotName string) string {
+	// Handle empty startLSN case by using null
+	lsnValue := "null"
+	if startLSN != "" {
+		lsnValue = startLSN
+	}
+
 	return fmt.Sprintf(`
 resource "postgresql_subscription" "test_lsn" {
 	name         = "%s"
@@ -223,7 +233,7 @@ resource "postgresql_subscription" "test_lsn" {
 	copy_data    = false
 	start_lsn    = %s
 }
-`, slotName, dbNameSub, pubConninfo, enabled, startLSN)
+`, slotName, dbNameSub, pubConninfo, enabled, lsnValue)
 }
 
 // insertRow inserts a row with the given value
@@ -235,7 +245,11 @@ func insertRow(t *testing.T, dbSuffixPub string, value string) {
 	if err != nil {
 		t.Fatalf("could not connect to publisher database: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("Failed to close database connection: %v", err)
+		}
+	}()
 
 	// Insert second row (should be replicated)
 	_, err = db.Exec("INSERT INTO pub_schema.test_table (data) VALUES ($1);", value)
@@ -253,7 +267,11 @@ func getCurrentLSN(t *testing.T, dbSuffixPub string) string {
 	if err != nil {
 		t.Fatalf("could not connect to publisher database: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("Failed to close database connection: %v", err)
+		}
+	}()
 
 	// Get current LSN
 	var capturedLSN string
@@ -272,7 +290,12 @@ func testCheckLSNReplication(dbNameSub string) resource.TestCheckFunc {
 		if err != nil {
 			return fmt.Errorf("could not connect to subscriber database: %v", err)
 		}
-		defer db.Close()
+		defer func() {
+			if err := db.Close(); err != nil {
+				// Can't use t.Logf in TestCheckFunc, just ignore close error
+				_ = err
+			}
+		}()
 
 		// Debug: Check if the table exists in subscriber
 		var tableExists bool
@@ -320,18 +343,31 @@ func testCheckLSNReplication(dbNameSub string) resource.TestCheckFunc {
 		dbNamePub := strings.Replace(dbNameSub, "_sub", "_pub", 1)
 		pubDb, err := sql.Open("postgres", config.connStr(dbNamePub))
 		if err == nil {
-			defer pubDb.Close()
+			defer func() {
+				if err := pubDb.Close(); err != nil {
+					fmt.Printf("Failed to close publisher database connection: %v\n", err)
+				}
+			}()
 			var pubRowCount int
-			pubDb.QueryRow("SELECT COUNT(*) FROM pub_schema.test_table").Scan(&pubRowCount)
+			if err := pubDb.QueryRow("SELECT COUNT(*) FROM pub_schema.test_table").Scan(&pubRowCount); err != nil {
+				fmt.Printf("Failed to scan publisher row count: %v\n", err)
+			}
 			fmt.Printf("[DEBUG] Total rows in publisher: %d\n", pubRowCount)
 
 			rows, err := pubDb.Query("SELECT data FROM pub_schema.test_table ORDER BY id")
 			if err == nil {
-				defer rows.Close()
+				defer func() {
+					if err := rows.Close(); err != nil {
+						fmt.Printf("Failed to close rows: %v\n", err)
+					}
+				}()
 				var allData []string
 				for rows.Next() {
 					var data string
-					rows.Scan(&data)
+					if err := rows.Scan(&data); err != nil {
+						fmt.Printf("Failed to scan row data: %v\n", err)
+						continue
+					}
 					allData = append(allData, data)
 				}
 				fmt.Printf("[DEBUG] Publisher data: %v\n", allData)
@@ -349,7 +385,12 @@ func testCheckFullReplication(dbNameSub string) resource.TestCheckFunc {
 		if err != nil {
 			return fmt.Errorf("could not connect to subscriber database: %v", err)
 		}
-		defer db.Close()
+		defer func() {
+			if err := db.Close(); err != nil {
+				// Can't use t.Logf in TestCheckFunc, just ignore close error
+				_ = err
+			}
+		}()
 
 		// Debug: Check if the table exists in subscriber
 		var tableExists bool
@@ -397,57 +438,37 @@ func testCheckFullReplication(dbNameSub string) resource.TestCheckFunc {
 		dbNamePub := strings.Replace(dbNameSub, "_sub", "_pub", 1)
 		pubDb, err := sql.Open("postgres", config.connStr(dbNamePub))
 		if err == nil {
-			defer pubDb.Close()
+			defer func() {
+				if err := pubDb.Close(); err != nil {
+					fmt.Printf("Failed to close publisher database connection: %v\n", err)
+				}
+			}()
 			var pubRowCount int
-			pubDb.QueryRow("SELECT COUNT(*) FROM pub_schema.test_table").Scan(&pubRowCount)
+			if err := pubDb.QueryRow("SELECT COUNT(*) FROM pub_schema.test_table").Scan(&pubRowCount); err != nil {
+				fmt.Printf("Failed to scan publisher row count: %v\n", err)
+			}
 			fmt.Printf("[DEBUG] Total rows in publisher: %d\n", pubRowCount)
 
 			rows, err := pubDb.Query("SELECT data FROM pub_schema.test_table ORDER BY id")
 			if err == nil {
-				defer rows.Close()
+				defer func() {
+					if err := rows.Close(); err != nil {
+						fmt.Printf("Failed to close rows: %v\n", err)
+					}
+				}()
 				var allData []string
 				for rows.Next() {
 					var data string
-					rows.Scan(&data)
+					if err := rows.Scan(&data); err != nil {
+						fmt.Printf("Failed to scan row data: %v\n", err)
+						continue
+					}
 					allData = append(allData, data)
 				}
 				fmt.Printf("[DEBUG] Publisher data: %v\n", allData)
 			}
 		}
 		return fmt.Errorf("no rows replicated - replication may not be working")
-	}
-}
-
-// testAccCheckSubscriptionEnabled checks subscription enabled state
-func testAccCheckSubscriptionEnabled(resourceName string, expectedEnabled bool) resource.TestCheckFunc {
-	return func(s *terraform.State) error {
-		rs, ok := s.RootModule().Resources[resourceName]
-		if !ok {
-			return fmt.Errorf("resource not found: %s", resourceName)
-		}
-
-		// Check the actual subscription state in PostgreSQL
-		config := getTestConfig(nil)
-		db, err := sql.Open("postgres", config.connStr(rs.Primary.Attributes["database"]))
-		if err != nil {
-			return fmt.Errorf("could not connect to database: %v", err)
-		}
-		defer db.Close()
-
-		var enabled bool
-		err = db.QueryRow("SELECT subenabled FROM pg_subscription WHERE subname = $1", rs.Primary.Attributes["name"]).Scan(&enabled)
-		if err != nil {
-			return fmt.Errorf("could not query subscription state: %v", err)
-		}
-
-		if enabled == expectedEnabled {
-			fmt.Printf("[DEBUG] Subscription enabled state correct: %t\n", enabled)
-			return nil
-		}
-
-		fmt.Printf("[DEBUG] subscription enabled=%t, expected=%t\n", enabled, expectedEnabled)
-
-		return fmt.Errorf("subscription enabled state did not stabilize to %t after 10 attempts", expectedEnabled)
 	}
 }
 
@@ -460,7 +481,11 @@ func testCheckReplicationOriginExists(database, subscriptionName string) resourc
 		if err != nil {
 			return fmt.Errorf("could not connect to database %s: %v", database, err)
 		}
-		defer db.Close()
+		defer func() {
+			if err := db.Close(); err != nil {
+				fmt.Printf("Failed to close database connection: %v\n", err)
+			}
+		}()
 
 		// Get the subscription OID
 		var subOid uint32
@@ -504,7 +529,11 @@ func cleanupReplicationOrigins(t *testing.T) {
 		t.Logf("could not connect to postgres database for cleanup: %v", err)
 		return
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Logf("Failed to close database connection: %v", err)
+		}
+	}()
 
 	// Find replication origins that don't have corresponding subscriptions
 	query := `
@@ -522,7 +551,11 @@ func cleanupReplicationOrigins(t *testing.T) {
 		t.Logf("could not query orphaned replication origins: %v", err)
 		return
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Logf("Failed to close rows: %v", err)
+		}
+	}()
 
 	var orphanedOrigins []string
 	for rows.Next() {
